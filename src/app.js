@@ -1,17 +1,20 @@
 import { buildProject, buyTrain, catalog, cities, newWorld, projectCost } from './railway.js';
-import { closestEndpoint, mercator, geographic, stationGeometry, trackGeometry } from './geometry.js';
+import { closestEndpoint, createProjection, mercator, geographic, stationGeometry, trackGeometry } from './geometry.js';
 import { compileServices, getActiveTrains, servicePeriods, validateRoute } from './simulation.js';
 import { drawMap, layerOptions } from './map.js';
+import { clearMapTiles, landUseStyles } from './basemap.js';
+import { boundaryLayers, mapLayerEnabled } from './geography-layers.js';
+import { findToolPosition, toolGap } from './tool-layout.js';
 
 const app = document.querySelector('#app');
 const notice = document.querySelector('#notice');
 const saves = window.railwaySaves;
 const money = new Intl.NumberFormat('en-US', { style:'currency', currency:'USD', maximumFractionDigits:0 });
 const speeds = [0,1,5,20];
-const tools = ['Projects','Build','Trains','Stations','Routes','Map','Settings'];
+const tools = ['Projects','Build','Trains','Stations','Routes','Population','Metrics','Finances','Map','Settings','Help'];
 const windows = new Map();
 let slots = [];
-let world, slot, canvas, viewport, budget, clock, hint, projection, camera;
+let world, slot, canvas, viewport, budget, clock, hint, camera;
 let schedules = [];
 let speed = 0;
 let placement = null;
@@ -20,6 +23,7 @@ let selectedProject;
 let zIndex = 0;
 let noticeTimer;
 let loading = false;
+let repaintFrame = 0;
 
 function element(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
@@ -76,9 +80,12 @@ async function readSlots() {
 }
 
 async function home() {
+  cancelToolDrag?.();
+  clearMapTiles();
   speed = 0;
   world = null;
   canvas = null;
+  toolResize.disconnect();
   windows.clear();
   document.documentElement.dataset.theme = localStorage.getItem('appearance') ?? 'standard';
   await readSlots();
@@ -91,7 +98,7 @@ async function home() {
     const entry = slots[index];
     card.append(element('strong',{},`Save ${entry.id}`),small(entry.world?.name ?? (entry.error ? 'Unable to open' : 'Empty slot')));
   });
-  app.replaceChildren(element('section',{class:'launch'},
+  app.replaceChildren(element('section',{class:'launch home'},
     element('h1',{},'National Railway Network'),
     element('section',{class:'tool'},
       div('content stack',div('row',
@@ -167,6 +174,13 @@ function pickCity(initialSlot) {
   });
   resize.observe(picker);
 }
+function overviewZoom() {
+  return Math.min(canvas.clientWidth/6800000,canvas.clientHeight/4100000);
+}
+function showUS(schedule = repaint) {
+  camera = {center:{lat:38.8,lon:-96},zoom:overviewZoom()};
+  schedule();
+}
 function startWorld(id, value) {
   slot = id;
   world = value;
@@ -174,6 +188,7 @@ function startWorld(id, value) {
   placement = null;
   preview = null;
   selectedProject = world.projects[0]?.id;
+  toolResize.disconnect();
   windows.clear();
   camera = { center:world.city,zoom:.024 };
   schedules = compileServices(world);
@@ -187,7 +202,7 @@ function startWorld(id, value) {
     action('+',() => zoomAt(1.6),{label:'Zoom in'}),
     action('−',() => zoomAt(.625),{label:'Zoom out'}),
     action('City',() => { camera = {center:world.city,zoom:.024}; repaint(); }),
-    action('U.S.',() => { camera = {center:{lat:38.8,lon:-96},zoom:Math.min(canvas.clientWidth/6800000,canvas.clientHeight/4100000)}; repaint(); })
+    action('U.S.',showUS)
   ),hint);
   budget = element('span',{id:'budget'});
   clock = element('span',{id:'clock'});
@@ -198,24 +213,43 @@ function startWorld(id, value) {
   const toolbar = div('toolbar',action('Home',async () => {
     await saves.save(slot,world);
     await home();
-  }),tools.map(name => action(name,() => openTool(name))));
+  }),tools.map(name => Object.hasOwn(renderers,name)
+    ? action(name,() => openTool(name))
+    : element('button',{type:'button','aria-disabled':'true',title:'Coming soon'},name)));
   const status = div('statusbar',
     div('row',element('strong',{},world.name),budget),
+    element('small',{class:'map-credit'},
+      element('a',{href:'https://www.openstreetmap.org/copyright',target:'_blank',rel:'noopener'},'© OpenStreetMap contributors'),
+      ' · Terrain: USGS 3DEP · Public lands: NPS, ',
+      element('a',{href:'https://catalog.data.gov/dataset/fs-national-forests-dataset-us-forest-service-proclaimed-forests',target:'_blank',rel:'noopener'},'U.S. Forest Service'),
+      ' · Names: ',
+      element('a',{href:'https://www.geonames.org/',target:'_blank',rel:'noopener'},'GeoNames')),
     div('row',clock,speedButtons));
   app.replaceChildren(div('game',toolbar,viewport,status));
   bindMap();
-  repaint();
+  if (world.stations.length || world.tracks.length || world.projects.some(project => project.items.length)) repaint();
+  else showUS();
 }
 function updateStatus() {
-  budget.textContent = money.format(world.budget);
+  const balance = money.format(world.budget);
   const day = Math.floor(world.clock/1440) + 1;
   const minute = Math.floor(world.clock)%1440;
-  clock.textContent = `Day ${day} · ${String(Math.floor(minute/60)).padStart(2,'0')}:${String(minute%60).padStart(2,'0')}`;
+  const time = `Day ${day} · ${String(Math.floor(minute/60)).padStart(2,'0')}:${String(minute%60).padStart(2,'0')}`;
+  if (budget.textContent !== balance) budget.textContent = balance;
+  if (clock.textContent !== time) clock.textContent = time;
 }
 function activeDraft() {
   return world.projects.find(project => project.id === selectedProject);
 }
+function queueRepaint() {
+  if (!repaintFrame) repaintFrame = requestAnimationFrame(() => {
+    repaintFrame = 0;
+    repaint();
+  });
+}
 function repaint() {
+  if (repaintFrame) cancelAnimationFrame(repaintFrame);
+  repaintFrame = 0;
   if (!canvas?.isConnected || !world) return;
   const current = new Map();
   const moment = world.clock % 1440;
@@ -223,20 +257,31 @@ function repaint() {
     const onDuty = moment >= entry.period.start && moment < entry.period.end;
     if (!current.has(entry.route.id) || onDuty) current.set(entry.route.id,entry);
   }
-  projection = drawMap(canvas,camera,world,{
+  drawMap(canvas,camera,world,{
+    repaint,
     drafts:activeDraft()?.items,preview,anchor:placement?.start?.point,
     routes:[...current.values()],trains:getActiveTrains(schedules,world.clock),
   });
   updateStatus();
 }
-function zoomAt(factor,x = canvas.clientWidth/2,y = canvas.clientHeight/2) {
-  const focal = mercator(projection.unproject({x,y}));
-  camera.zoom = Math.min(4,Math.max(.00007,camera.zoom*factor));
+function zoomAt(factor,x = canvas.clientWidth/2,y = canvas.clientHeight/2,schedule = repaint) {
+  const nextZoom = camera.zoom*factor;
+  if (factor < 1 && nextZoom <= overviewZoom()) {
+    if (camera.zoom !== overviewZoom() || camera.center.lat !== 38.8 || camera.center.lon !== -96) showUS(schedule);
+    return;
+  }
+  const zoom = Math.min(4,nextZoom);
+  if (zoom === camera.zoom) return;
+  const center = mercator(camera.center);
+  const dx = x-canvas.clientWidth/2;
+  const dy = y-canvas.clientHeight/2;
+  const focalShift = 1/camera.zoom-1/zoom;
   camera.center = geographic({
-    x:focal.x-(x-canvas.clientWidth/2)/camera.zoom,
-    y:focal.y+(y-canvas.clientHeight/2)/camera.zoom,
+    x:center.x+dx*focalShift,
+    y:center.y-dy*focalShift,
   });
-  repaint();
+  camera.zoom = zoom;
+  schedule();
 }
 function bindMap() {
   let down;
@@ -244,10 +289,13 @@ function bindMap() {
     const rect = canvas.getBoundingClientRect();
     return {x:event.clientX-rect.left,y:event.clientY-rect.top};
   }
+  function mapPosition(point) {
+    return createProjection(camera.center,camera.zoom,canvas.clientWidth,canvas.clientHeight).unproject(point);
+  }
   canvas.addEventListener('wheel',event => {
     event.preventDefault();
     const {x,y} = mouse(event);
-    zoomAt(Math.exp(-event.deltaY*.0015),x,y);
+    zoomAt(Math.exp(-event.deltaY*.0015),x,y,queueRepaint);
   },{passive:false});
   canvas.addEventListener('pointerdown',event => {
     canvas.setPointerCapture(event.pointerId);
@@ -261,20 +309,21 @@ function bindMap() {
       if (down.moving || Math.hypot(dx,dy)>4) {
         down.moving = true;
         camera.center = geographic({x:down.center.x-dx/camera.zoom,y:down.center.y+dy/camera.zoom});
+        queueRepaint();
       }
     } else if (placement) {
-      const position = projection.unproject(point);
+      const position = mapPosition(point);
       if (placement.kind === 'station') preview = {...placement,points:stationGeometry(position,placement.length,placement.heading)};
       else if (placement.start) {
         const end = snapped(position);
         preview = {...placement,points:trackGeometry(placement.start.point,end.point,placement.start.inside,end.inside)};
       }
+      queueRepaint();
     }
-    repaint();
   });
   canvas.addEventListener('pointerup',event => {
     if (down && !down.moving && placement) {
-      try { place(projection.unproject(mouse(event))); } catch (error) { tell(error.message); }
+      try { place(mapPosition(mouse(event))); } catch (error) { tell(error.message); }
     }
     down = null;
   });
@@ -336,7 +385,82 @@ function createProject(name = `Project ${world.projects.length+1}`) {
 function refresh(name) { windows.get(name)?.render(); }
 
 const renderers = { Build:buildView,Projects:projectView,Trains:trainView,Stations:stationView,Routes:routeView,Map:mapView,Settings:settingsView };
+let cancelToolDrag;
+const toolBounds = () => ({width:viewport.clientWidth,height:viewport.clientHeight});
+const toolRect = panel => ({
+  x:panel.offsetLeft,y:panel.offsetTop,width:panel.offsetWidth,height:panel.offsetHeight,
+});
+function positionTool(panel, {x,y}) {
+  panel.style.left = x+'px';
+  panel.style.top = y+'px';
+  panel.style.right = 'auto';
+}
+function limitToolResize() {
+  if (cancelToolDrag) return;
+  const panels = [...windows.values()].map(({panel}) => panel);
+  const rects = panels.map(toolRect);
+  const bounds = toolBounds();
+  panels.forEach((panel,index) => {
+    const rect = rects[index];
+    let right = bounds.width;
+    let bottom = bounds.height;
+    for (const other of rects) {
+      // Account for diagonal growth from the bottom-right resize handle.
+      if (other.x >= rect.x+rect.width+toolGap && other.y+other.height+toolGap > rect.y) {
+        right = Math.min(right,other.x-toolGap);
+      }
+      if (other.y >= rect.y+rect.height+toolGap &&
+          other.x-toolGap < rect.x+rect.width && other.x+other.width+toolGap > rect.x) {
+        bottom = Math.min(bottom,other.y-toolGap);
+      }
+    }
+    panel.style.maxWidth = right-rect.x+'px';
+    panel.style.maxHeight = bottom-rect.y+'px';
+  });
+}
+const toolResize = new ResizeObserver(() => {
+  if (windows.size) limitToolResize();
+});
+function closeTool(name) {
+  const {panel} = windows.get(name);
+  toolResize.unobserve(panel);
+  panel.remove();
+  windows.delete(name);
+  if (windows.size) limitToolResize();
+}
+function fitTool(panel, occupied, bounds, preferred) {
+  const {width,height} = toolRect(panel);
+  const style = getComputedStyle(panel);
+  const minimum = {width:parseFloat(style.minWidth),height:parseFloat(style.minHeight)};
+  const position = findToolPosition({...preferred,width,height},minimum,occupied,bounds);
+  if (!position) return null;
+  panel.style.width = position.width+'px';
+  panel.style.height = position.height+'px';
+  positionTool(panel,position);
+  return position;
+}
+function reflowTools() {
+  cancelToolDrag?.();
+  if (!windows.size) return;
+  const bounds = toolBounds();
+  const occupied = [];
+  const overflow = [];
+  for (const [name,{panel}] of windows) {
+    const {x,y,width,height} = toolRect(panel);
+    const preferred = {
+      x:Math.max(0,Math.min(bounds.width-width,x)),
+      y:Math.max(0,Math.min(bounds.height-height,y)),
+    };
+    const position = fitTool(panel,occupied,bounds,preferred);
+    if (position) occupied.push(position);
+    else overflow.push(name);
+  }
+  overflow.forEach(closeTool);
+  limitToolResize();
+  if (overflow.length) tell('Some tools closed because the window is too small.');
+}
 function openTool(name) {
+  cancelToolDrag?.();
   if (windows.has(name)) {
     windows.get(name).panel.style.zIndex = ++zIndex;
     return;
@@ -345,40 +469,78 @@ function openTool(name) {
   const panel = element('section',{class:'tool','aria-label':name});
   const state = {};
   const render = () => content.replaceChildren(...renderers[name](state,render));
+  let settleAnimation;
+  const settle = (target, fallback) => {
+    const before = toolRect(panel);
+    settleAnimation?.cancel();
+    const occupied = [...windows.values()].filter(other => other.panel !== panel).map(other => toolRect(other.panel));
+    const after = fitTool(panel,occupied,toolBounds(),target) ?? fallback;
+    positionTool(panel,after);
+    limitToolResize();
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches ||
+        (before.x === after.x && before.y === after.y && before.width === after.width && before.height === after.height)) return;
+    settleAnimation = panel.animate([
+      {
+        transformOrigin:'top left',
+        transform:`translate(${before.x-after.x}px,${before.y-after.y}px) scale(${before.width/after.width},${before.height/after.height})`,
+      },
+      {transformOrigin:'top left',transform:'none'},
+    ],{duration:170,easing:'ease-out'});
+  };
   const snap = side => {
-    panel.style.removeProperty('top');
-    panel.style.removeProperty('left');
-    panel.style.removeProperty('right');
-    panel.classList.toggle('left',side === 'left');
+    const current = toolRect(panel);
+    settle({x:side === 'left' ? 16 : viewport.clientWidth-current.width-16,y:16},current);
   };
   const header = element('header',{},element('h2',{},name),div('row',
     action('Left',() => snap('left'),{title:'Snap left'}),
     action('Right',() => snap('right'),{title:'Snap right'}),
-    action('×',() => { panel.remove(); windows.delete(name); },{label:`Close ${name}`})));
+    action('×',() => closeTool(name),{label:`Close ${name}`})));
   panel.append(header,content);
   panel.style.zIndex = ++zIndex;
   panel.addEventListener('pointerdown',() => { panel.style.zIndex = ++zIndex; });
   let drag;
   header.addEventListener('pointerdown',event => {
-    if (event.target.closest('button')) return;
-    drag = {x:event.clientX-panel.offsetLeft,y:event.clientY-panel.offsetTop};
+    if (event.button !== 0 || cancelToolDrag || event.target.closest('button')) return;
+    settleAnimation?.cancel();
+    const origin = toolRect(panel);
+    drag = {origin,x:event.clientX-origin.x,y:event.clientY-origin.y,id:event.pointerId};
+    cancelToolDrag = () => {
+      const {id} = drag;
+      drag = null;
+      cancelToolDrag = null;
+      positionTool(panel,origin);
+      if (header.hasPointerCapture(id)) header.releasePointerCapture(id);
+      limitToolResize();
+    };
     header.setPointerCapture(event.pointerId);
   });
   header.addEventListener('pointermove',event => {
-    if (!drag) return;
-    panel.style.left = Math.max(0,Math.min(viewport.clientWidth-panel.offsetWidth,event.clientX-drag.x))+'px';
-    panel.style.top = Math.max(0,Math.min(viewport.clientHeight-50,event.clientY-drag.y))+'px';
-    panel.style.right = 'auto';
+    if (drag?.id !== event.pointerId) return;
+    positionTool(panel,{
+      x:Math.max(0,Math.min(viewport.clientWidth-drag.origin.width,event.clientX-drag.x)),
+      y:Math.max(0,Math.min(viewport.clientHeight-drag.origin.height,event.clientY-drag.y)),
+    });
   });
   header.addEventListener('pointerup',event => {
-    if (!drag) return;
+    if (drag?.id !== event.pointerId) return;
+    const {origin} = drag;
     drag = null;
-    if (event.clientX < 32) snap('left');
-    else if (event.clientX > viewport.clientWidth-32) snap('right');
+    cancelToolDrag = null;
+    settle(toolRect(panel),origin);
   });
-  header.addEventListener('pointercancel',() => { drag = null; });
-  windows.set(name,{panel,render});
+  header.addEventListener('lostpointercapture',event => {
+    if (drag?.id === event.pointerId) cancelToolDrag();
+  });
   viewport.append(panel);
+  const occupied = [...windows.values()].map(({panel}) => toolRect(panel));
+  if (!fitTool(panel,occupied,toolBounds(),toolRect(panel))) {
+    panel.remove();
+    tell('Close or move another tool to make room.');
+    return;
+  }
+  windows.set(name,{panel,render});
+  limitToolResize();
+  toolResize.observe(panel);
   render();
 }
 function tabs(names, selected, change) {
@@ -624,10 +786,20 @@ function stopEditor(stops, render) {
   ];
 }
 function mapView() {
-  return Object.entries(layerOptions).map(([id,label]) => toggle(label,world.layers[id] !== false,value => {
+  const control = id => toggle(layerOptions[id],mapLayerEnabled(world.layers,id),value => {
     world.layers[id] = value;
     repaint();
+  });
+  const controls = Object.keys(layerOptions).filter(id => !boundaryLayers.includes(id)).map(control);
+  const boundaries = element('fieldset',{class:'map-boundaries'},
+    element('legend',{},'Boundaries'),
+    div('stack',boundaryLayers.map(control),small('County and ZIP Code boundaries appear as you zoom in.')));
+  const legend = div('map-legend',Object.values(landUseStyles).map(({label,color}) => {
+    const swatch = element('span',{class:'map-swatch','aria-hidden':'true'});
+    swatch.style.backgroundColor = color;
+    return element('small',{},swatch,label);
   }));
+  return [...controls,boundaries,legend];
 }
 function settingsView(state, render) {
   const appearance = select([['standard','Standard'],['contrast','High contrast']],document.documentElement.dataset.theme);
@@ -657,7 +829,10 @@ function settingsView(state, render) {
     }) : null))];
 }
 
-window.addEventListener('resize',repaint);
+window.addEventListener('resize',() => {
+  reflowTools();
+  queueRepaint();
+});
 window.addEventListener('keydown',event => { if (event.key === 'Escape' && placement) cancelPlacement(); });
 setInterval(() => {
   if (!world || !speed) return;
